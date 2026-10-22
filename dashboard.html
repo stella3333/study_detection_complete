@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>智慧讀書專注偵測</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f2f5f2;color:#18332b;font-family:system-ui,"Noto Sans TC",sans-serif}
+main{max-width:1000px;margin:36px auto;padding:24px}
+h1{font-size:clamp(1.5rem,5vw,2.2rem);margin:0 0 8px}.subtitle{color:#577067;margin:0 0 24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}
+.card{background:white;border-radius:18px;padding:22px;box-shadow:0 6px 22px #18332b12;overflow:visible}
+.label{color:#577067;font-size:.95rem}.value{font-size:clamp(1.4rem,3vw,1.8rem);font-weight:750;margin-top:8px;display:block;white-space:nowrap}
+#state{white-space:pre-line;}
+#timer{font-variant-numeric:tabular-nums;letter-spacing:.03em}
+.note{color:#577067;font-size:.9rem;line-height:1.6;margin-top:20px}
+#connection,#settingsMessage,#historyMessage{margin-top:12px;font-size:.9rem;color:#577067}
+form{display:flex;flex-wrap:wrap;align-items:end;gap:12px;margin:20px 0}
+form label{display:grid;gap:6px;color:#577067;font-size:.9rem}
+input,button{font:inherit;border:1px solid #cad8d2;border-radius:9px;padding:10px 12px}
+input{color:#18332b}button{background:#286b54;color:white;border:0;font-weight:700;cursor:pointer}
+#boardUrl{width:min(360px,80vw)}.settings input{width:120px}
+table{width:100%;border-collapse:collapse;background:white;border-radius:14px;overflow:hidden}
+th,td{text-align:left;padding:12px;border-bottom:1px solid #e4ece8}
+th{color:#577067;font-size:.9rem}td{font-variant-numeric:tabular-nums}
+.tableWrap{overflow-x:auto;margin-top:12px}
+@media(max-width:600px){main{margin:16px auto;padding:16px}th,td{padding:9px;font-size:.86rem}}
+</style>
+</head>
+<body><main>
+<h1>智慧讀書專注偵測</h1>
+<p class="subtitle">人臉辨識與計時由 AMB82-MINI 開發板執行</p>
+<form id="connectForm">
+<label>開發板網址（Serial Monitor 的 IP）<input id="boardUrl" type="text" inputmode="url" placeholder="http://192.168.1.154" required></label>
+<button type="submit">連線</button>
+</form>
+<section class="grid">
+<article class="card"><div class="label">累積讀書時間</div><div id="timer" class="value">00:00:00</div></article>
+<article class="card"><div class="label">目前狀態</div><div id="state" class="value">尚未連線</div><div class="label" id="detail"></div></article>
+<article class="card"><div class="label">離席次數</div><div id="leaves" class="value">0</div></article>
+<article class="card"><div class="label">番茄鐘</div><div id="pomodoroPhase" class="value">計時器未啟動</div><div id="pomodoroTimer" class="label">05:00</div></article>
+</section>
+<form id="settingsForm" class="settings">
+<label>專注時間（分鐘）<input id="focusMinutes" name="focusMinutes" type="number" min="1" max="180" value="5" required></label>
+<label>休息時間（分鐘）<input id="breakMinutes" name="breakMinutes" type="number" min="1" max="60" value="1" required></label>
+<button type="submit">儲存設定</button>
+</form>
+<div id="settingsMessage"></div>
+<section>
+<h2>離席歷史</h2>
+<div class="grid">
+<article class="card"><div class="label">當日累積離席時間</div><div id="todayAway" class="value">00:00:00</div></article>
+</div>
+<div id="historyMessage">歷史記錄會在開發板重新啟動後清空；保留最近 50 次離席。</div>
+<div class="tableWrap">
+<table>
+<thead><tr><th>離席開始時間</th><th>返回時間</th><th>離席持續</th></tr></thead>
+<tbody id="historyRows"><tr><td colspan="3">尚無離席紀錄</td></tr></tbody>
+</table>
+</div>
+</section>
+<p class="note">偵測到人臉連續 15 秒後開始專注計時。人臉消失未滿 30 秒時保留專注計時；超過 30 秒才暫停並計為一次離席。休息期間不計離席；休息結束後若未偵測到人臉，重新開始 30 秒寬限。離席日期時間使用網路校時（UTC+8）；若網路無法連上 NTP，紀錄時間會留白。</p>
+<div id="connection">請輸入開發板網址並連線。</div>
+</main>
+<script>
+const labels={WAITING:"等待人臉",STARTING:"確認專注中",FOCUSING:"讀書計時中",AWAY_GRACE:"暫時離開\n（計時保留）",PAUSED:"已暫停，等待返回"};
+const boardUrl=document.getElementById("boardUrl");
+let boardBase="",lastTransitionId=null,lastPhase=null,settingsInitialized=false,statusRequestInFlight=false,historyRequestInFlight=false,connectionGeneration=0,statusError="",historyError="";
+boardUrl.value=localStorage.getItem("studyBoardUrl")||new URLSearchParams(location.search).get("board")||"";
+function formatTime(seconds){const h=Math.floor(seconds/3600),m=Math.floor(seconds%3600/60),s=seconds%60;return [h,m,s].map(n=>String(n).padStart(2,"0")).join(":")}
+function formatCountdown(seconds){return String(Math.floor(seconds/60)).padStart(2,"0")+":"+String(seconds%60).padStart(2,"0")}
+async function getApi(path){const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),4000);let response;try{response=await fetch(boardBase+path,{cache:"no-store",signal:controller.signal});}catch(error){throw new Error(error.name==="AbortError"?"開發板 API 請求逾時":"瀏覽器無法連到開發板 API（網路或跨來源請求遭阻擋）");}finally{clearTimeout(timeout);}if(!response.ok)throw new Error("開發板回應 HTTP "+response.status+"；請確認已重新上傳新版 .ino 韌體");try{return await response.json();}catch(error){throw new Error("開發板回傳資料格式錯誤；請確認韌體版本");}}
+function showHistory(data){document.getElementById("todayAway").textContent=formatTime(data.todayAwaySeconds);document.getElementById("historyMessage").textContent=data.timeSynced?"日期時間已校準（UTC+8）；最多顯示最近 50 次，本次開機的當日總計會累加所有離席。":"尚未取得網路時間，紀錄時間無法顯示；確認開發板可連上網際網路後等待校時。";const rows=document.getElementById("historyRows");rows.replaceChildren();if(!data.records.length){const row=rows.insertRow();const cell=row.insertCell();cell.colSpan=3;cell.textContent="尚無離席紀錄";return;}for(const record of data.records){const row=rows.insertRow();row.insertCell().textContent=record.startedAt||"時間未校準";row.insertCell().textContent=record.completed?(record.returnedAt||"時間未校準"):"尚未返回";row.insertCell().textContent=formatTime(record.durationSeconds);}}
+function updateConnectionMessage(){const message=statusError?`狀態暫時無法更新：${statusError}（保留上次資料）`:historyError?`歷史紀錄暫時無法更新：${historyError}（保留上次資料）`:statusRequestInFlight||historyRequestInFlight?"正在更新開發板資料…":"已連線至開發板";document.getElementById("connection").textContent=message;}
+async function refreshStatus(generation=connectionGeneration){if(!boardBase||statusRequestInFlight)return;statusRequestInFlight=true;updateConnectionMessage();try{const data=await getApi("/api/status");if(generation!==connectionGeneration)return;document.getElementById("timer").textContent=formatTime(data.elapsedSeconds);document.getElementById("leaves").textContent=data.leaveCount;document.getElementById("state").textContent=labels[data.state]||data.state;document.getElementById("detail").textContent=data.state==="STARTING"?"開始計時倒數 "+data.startRemainingSeconds+" 秒":data.facePresent?"已偵測到人臉":"目前未偵測到人臉";document.getElementById("pomodoroPhase").textContent=!data.started?"計時器未啟動":data.state==="PAUSED"?"暫停中":data.phase==="BREAK"?"休息中":"專注中";document.getElementById("pomodoroTimer").textContent=formatCountdown(data.phaseRemainingSeconds);if(!settingsInitialized){document.getElementById("focusMinutes").value=data.focusMinutes;document.getElementById("breakMinutes").value=data.breakMinutes;settingsInitialized=true;}if(lastTransitionId!==null&&data.transitionId!==lastTransitionId&&lastPhase!==data.phase){if(data.phase==="BREAK")window.alert("專注時間結束，請休息 "+data.breakMinutes+" 分鐘。");else if(lastPhase==="BREAK")window.alert("休息時間結束，請開始下一輪專注。");}lastTransitionId=data.transitionId;lastPhase=data.phase;statusError="";}catch(error){if(generation===connectionGeneration)statusError=error.message;}finally{statusRequestInFlight=false;if(generation===connectionGeneration)updateConnectionMessage();}}
+async function refreshHistory(generation=connectionGeneration){if(!boardBase||historyRequestInFlight)return;historyRequestInFlight=true;updateConnectionMessage();try{const data=await getApi("/api/history");if(generation!==connectionGeneration)return;showHistory(data);historyError="";}catch(error){if(generation===connectionGeneration)historyError=error.message;}finally{historyRequestInFlight=false;if(generation===connectionGeneration)updateConnectionMessage();}}
+function refreshAll(){refreshStatus();refreshHistory();}
+document.getElementById("connectForm").addEventListener("submit",event=>{event.preventDefault();const enteredUrl=boardUrl.value.trim();if(!enteredUrl)return;try{const url=new URL(/^https?:\/\//i.test(enteredUrl)?enteredUrl:"http://"+enteredUrl);if(url.protocol!=="http:"&&url.protocol!=="https:")throw new Error("Use HTTP or HTTPS");boardBase=url.origin;boardUrl.value=boardBase;localStorage.setItem("studyBoardUrl",boardBase);connectionGeneration++;lastTransitionId=null;lastPhase=null;settingsInitialized=false;statusError="";historyError="";document.getElementById("state").textContent="連線中";document.getElementById("detail").textContent="正在讀取開發板狀態…";updateConnectionMessage();refreshAll();}catch(error){document.getElementById("state").textContent="連線失敗";document.getElementById("detail").textContent="網址格式錯誤";document.getElementById("connection").textContent="請輸入開發板 IP，例如 192.168.1.154。";}});
+document.getElementById("settingsForm").addEventListener("submit",async event=>{event.preventDefault();if(!boardBase){document.getElementById("settingsMessage").textContent="請先連線至開發板。";return;}const form=event.currentTarget;if(!form.reportValidity())return;const values=new URLSearchParams(new FormData(form));try{const result=await getApi("/api/settings?"+values.toString());document.getElementById("settingsMessage").textContent="設定已儲存，將於下一階段生效。";}catch(error){document.getElementById("settingsMessage").textContent="設定失敗，請確認數值及開發板連線。";}});
+setInterval(refreshStatus,1000);setInterval(refreshHistory,5000);
+</script>
+</body></html>
